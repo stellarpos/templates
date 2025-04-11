@@ -1,0 +1,338 @@
+name: Deploy ECS & Deploy to ECS 
+description: "Deploy to Amazon ECS with automated networking setup"
+author: "Praveen Sansaniwal"
+inputs:
+  deploy_branch:
+    description: 'Branch to deploy from'
+    required: true
+    default: 'main'
+  aws_region:
+    description: 'AWS region'
+    required: true
+    default: 'us-west-2'
+  ecr_repository:
+    description: 'ECR repository'
+    required: true
+    default: 'my-app'
+  service_name:
+    description: 'Service name'
+    required: true
+    default: 'MyService'
+  ecs_cluster_name:
+    description: 'ECS cluster name'
+    required: true
+    default: 'my-cluster'
+  dockerfile_path:
+    description: 'Path to Dockerfile'
+    required: true
+    default: 'Dockerfile'
+  app_port:
+    description: 'Application port'
+    required: true
+    default: '80'
+  task_definition:
+    description: 'Task Definition Name'
+    required: true
+    default: 'mycluster'
+  aws_access_key_id:
+    description: 'AWS_ACCESS_KEY_ID'
+    required: true
+  aws_secret_access_key:
+    description: 'AWS_SECRET_ACCESS_KEY'
+    required: true
+  docker_registry:
+    description: 'AWS ECR Registry Like ACCOUNTID.dkr.ecr.REGION.amazonaws.com'
+    required: true
+  execution_role_arn:
+    description: 'arn:aws:iam::123456789012:role/ecsTaskExecutionRole'
+    required: true
+  cpu:
+    description: 'AWS ECR Registry Like ACCOUNTID.dkr.ecr.REGION.amazonaws.com'
+    required: true
+    default: '1024'
+  ram:
+    description: 'arn:aws:iam::123456789012:role/ecsTaskExecutionRole'
+    required: true
+    default: '2048'
+
+
+runs:
+  using: "composite"
+  steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{ inputs.aws_access_key_id }}
+        aws-secret-access-key: ${{ inputs.aws_secret_access_key }}
+        aws-region: ${{ inputs.aws_region }}
+
+    - name: Check and create ECR repository
+      shell: bash
+      run: |
+        if ! aws ecr describe-repositories --repository-names ${{ inputs.ecr_repository }} >/dev/null 2>&1; then
+          echo "Creating ECR repository ${{ inputs.ecr_repository }}"
+          aws ecr create-repository --repository-name ${{ inputs.ecr_repository }}
+        else
+          echo "ECR repository ${{ inputs.ecr_repository }} already exists"
+        fi
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+
+    - name: Determine Dockerfile path
+      id: dockerfile-path
+      shell: bash  
+      run: |
+        if [ -f "${{ inputs.dockerfile_path }}" ]; then
+          echo "DOCKERFILE=${{ inputs.dockerfile_path }}" >> $GITHUB_OUTPUT
+        elif [ -f "dockerfile" ]; then
+          echo "DOCKERFILE=dockerfile" >> $GITHUB_OUTPUT
+        elif [ -f "Dockerfile" ]; then
+          echo "DOCKERFILE=Dockerfile" >> $GITHUB_OUTPUT
+        else
+          echo "No Dockerfile found"
+          exit 1
+        fi
+
+    - name: Build, tag, and push image to Amazon ECR
+      id: build-image
+      shell: bash  
+      env:
+        ECR_REGISTRY: ${{ inputs.docker_registry }}
+        ECR_REPOSITORY: ${{ inputs.ecr_repository }}
+        IMAGE_TAG: ${{ inputs.service_name }}-${{ github.sha }}
+      run: |
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -f ${{ steps.dockerfile-path.outputs.DOCKERFILE }} .
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+        echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+    - name: Check and create ECS cluster
+      shell: bash
+      run: |
+        if ! aws ecs describe-clusters --clusters ${{ inputs.ecs_cluster_name }} --query 'clusters[0]' >/dev/null 2>&1; then
+          echo "Creating ECS cluster ${{ inputs.ecs_cluster_name }}"
+          aws ecs create-cluster --cluster-name ${{ inputs.ecs_cluster_name }}
+        else
+          echo "ECS cluster ${{ inputs.ecs_cluster_name }} already exists"
+        fi
+        
+    - name: Setup networking
+      id: setup-networking
+      env:
+        APP_PORT: ${{ inputs.app_port }}
+      shell: bash
+      run: |
+        set -e  # Exit immediately if a command exits with a non-zero status
+        set -x  # Enable verbose mode to print each command
+        
+        echo "Starting networking setup..."
+        
+        # Get default VPC ID
+        VPC_ID=$(aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" --query "Vpcs[0].VpcId" --output text)
+        echo "Using default VPC: $VPC_ID"
+        
+        # Get default subnet IDs
+        SUBNET_IDS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --query "Subnets[?MapPublicIpOnLaunch==\`true\`].SubnetId" --output text)
+        echo "Using default subnets: $SUBNET_IDS"
+        
+        # Security Group name
+        SG_NAME="${{ inputs.service_name }}-sg"
+        echo "Security group name: $SG_NAME"
+        
+        # Check if the security group already exists
+        echo "Checking for existing security group..."
+        EXISTING_SG_ID=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=$SG_NAME" "Name=vpc-id,Values=$VPC_ID" --query "SecurityGroups[0].GroupId" --output text)
+        echo "Existing security group ID: $EXISTING_SG_ID"
+        
+        if [ "$EXISTING_SG_ID" != "None" ]; then
+            # Security group already exists
+            SG_ID=$EXISTING_SG_ID
+            echo "Security group $SG_NAME already exists: $SG_ID"
+        else
+            # Create new security group
+            echo "Creating new security group..."
+            SG_ID=$(aws ec2 create-security-group --group-name $SG_NAME --description "Security group for ${{ inputs.service_name }}" --vpc-id $VPC_ID --query "GroupId" --output text)
+            echo "Created new security group: $SG_ID"
+        fi
+        
+        # Function to check if a rule exists
+        function check_rule_exists() {
+            PORT=$1
+            echo "Checking if rule exists for port $PORT..."
+            EXISTS=$(aws ec2 describe-security-groups --group-ids $SG_ID --query "SecurityGroups[0].IpPermissions[?FromPort==\`$PORT\` && ToPort==\`$PORT\` && IpProtocol=='tcp' && IpRanges[?CidrIp=='0.0.0.0/0']]" --output text)
+            if [ -z "$EXISTS" ]; then
+                echo "Rule for port $PORT does not exist"
+                return 1  # Rule does not exist
+            else
+                echo "Rule for port $PORT exists"
+                return 0  # Rule exists
+            fi
+        }
+        
+        # Function to add a rule
+        function add_rule() {
+            PORT=$1
+            echo "Adding inbound rule for port: $PORT"
+            aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port $PORT --cidr 0.0.0.0/0
+            echo "Added inbound rule for port: $PORT"
+        }
+        
+        # Check and add rule for the custom application port
+        APP_PORT=${{ inputs.app_port }}
+        echo "Checking application port rule: $APP_PORT"
+        if ! check_rule_exists $APP_PORT; then
+            add_rule $APP_PORT
+        else
+            echo "Inbound rule for application port $APP_PORT already exists, skipping."
+        fi
+        
+        # Check and add rule for port 80 (HTTP)
+        echo "Checking HTTP port rule"
+        if ! check_rule_exists 80; then
+            add_rule 80
+        else
+            echo "Inbound rule for port 80 (HTTP) already exists, skipping."
+        fi
+        
+        # Check and add rule for port 443 (HTTPS)
+        echo "Checking HTTPS port rule"
+        if ! check_rule_exists 443; then
+            add_rule 443
+        else
+            echo "Inbound rule for port 443 (HTTPS) already exists, skipping."
+        fi
+        
+        # Output values
+        echo "Outputting values..."
+        echo "vpc_id=$VPC_ID" >> $GITHUB_OUTPUT
+        echo "subnet_ids=$SUBNET_IDS" >> $GITHUB_OUTPUT
+        echo "security_group_id=$SG_ID" >> $GITHUB_OUTPUT
+        
+        echo "Networking setup completed."
+    
+    - name: Check and update/create task definition
+      shell: bash
+      env:
+        TASK_DEFINITION: ${{ inputs.task_definition }}
+        IMAGE: ${{ steps.build-image.outputs.image }}
+        EXECUTION_ROLE_ARN: ${{ inputs.execution_role_arn }}  # Execution role ARN is needed
+        SERVICE_NAME: ${{ inputs.service_name }}
+        APP_PORT: ${{ inputs.app_port }}
+        CPU: ${{ inputs.cpu }}
+        RAM: ${{ inputs.ram }}
+      run: |
+        if [ -z "$EXECUTION_ROLE_ARN" ]; then
+          echo "Error: EXECUTION_ROLE_ARN is not provided."
+          exit 1
+        fi
+    
+        if aws ecs describe-task-definition --task-definition $TASK_DEFINITION >/dev/null 2>&1; then
+          echo "Updating existing task definition $TASK_DEFINITION"
+          
+          # Fetch the current task definition and clean unnecessary fields
+          TASK_DEF=$(aws ecs describe-task-definition --task-definition $TASK_DEFINITION --query 'taskDefinition')
+          CLEAN_TASK_DEF=$(echo $TASK_DEF | jq 'del(.revision, .status, .taskDefinitionArn, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)')
+          
+          # Update the image field with the new image
+          NEW_TASK_DEF=$(echo $CLEAN_TASK_DEF | jq --arg IMAGE "$IMAGE" '.containerDefinitions[0].image = $IMAGE')
+    
+          # Register the new task definition
+          NEW_TASK_DEF_ARN=$(aws ecs register-task-definition --cli-input-json "$NEW_TASK_DEF" --query 'taskDefinition.taskDefinitionArn' --output text)
+    
+        else
+          echo "Creating new task definition $TASK_DEFINITION"
+          
+          # Create a new task definition with required fields, including execution role ARN
+          NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --family $TASK_DEFINITION \
+            --network-mode awsvpc \
+            --requires-compatibilities FARGATE \
+            --execution-role-arn "$EXECUTION_ROLE_ARN" \
+            --cpu $CPU \
+            --memory $RAM \
+            --container-definitions "[{\"name\":\"$SERVICE_NAME\",\"image\":\"$IMAGE\",\"portMappings\":[{\"containerPort\":$APP_PORT,\"hostPort\":$APP_PORT}],\"essential\":true}]" \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+        fi
+        
+        echo "TASK_DEFINITION_ARN=$NEW_TASK_DEF_ARN" >> $GITHUB_ENV
+
+
+    - name: Create or update ECS service with ALB
+      shell: bash
+      env:
+        SERVICE_NAME: ${{ inputs.service_name }}
+        CLUSTER_NAME: ${{ inputs.ecs_cluster_name }}
+        VPC_ID: ${{ steps.setup-networking.outputs.vpc_id }}
+        SUBNET_IDS: ${{ steps.setup-networking.outputs.subnet_ids }}
+        SECURITY_GROUP_ID: ${{ steps.setup-networking.outputs.security_group_id }}
+      run: |
+        # Check if the service exists
+        SERVICE_EXISTS=$(aws ecs describe-services \
+          --cluster $CLUSTER_NAME \
+          --services $SERVICE_NAME \
+          --query 'services | length(@)' \
+          --output text)
+        
+        if [ "$SERVICE_EXISTS" -gt 0 ]; then
+          echo "Updating existing service $SERVICE_NAME"
+          aws ecs update-service \
+            --cluster $CLUSTER_NAME \
+            --service $SERVICE_NAME \
+            --task-definition $TASK_DEFINITION_ARN \
+            --force-new-deployment
+          aws ecs wait services-stable \
+            --cluster $CLUSTER_NAME \
+            --services $SERVICE_NAME
+
+        else
+          echo "Creating new service $SERVICE_NAME with ALB"
+          
+          # Create ALB
+          ALB_ARN=$(aws elbv2 create-load-balancer \
+            --name ${SERVICE_NAME}-alb \
+            --subnets $SUBNET_IDS \
+            --security-groups $SECURITY_GROUP_ID \
+            --query 'LoadBalancers[0].LoadBalancerArn' \
+            --output text)
+          
+          echo "Created ALB: $ALB_ARN"
+          
+          # Create target group
+          TG_ARN=$(aws elbv2 create-target-group \
+            --name ${SERVICE_NAME}-tg \
+            --protocol HTTP \
+            --port 8080 \
+            --vpc-id $VPC_ID \
+            --target-type ip \
+            --query 'TargetGroups[0].TargetGroupArn' \
+            --output text)
+          
+          echo "Created target group: $TG_ARN"
+          
+          # Create listener
+          aws elbv2 create-listener \
+            --load-balancer-arn $ALB_ARN \
+            --protocol HTTP \
+            --port 80 \
+            --default-actions Type=forward,TargetGroupArn=$TG_ARN
+          
+          echo "Created listener for ALB"
+          
+          # Create ECS service
+          aws ecs create-service \
+            --cluster $CLUSTER_NAME \
+            --service-name $SERVICE_NAME \
+            --task-definition $TASK_DEFINITION_ARN \
+            --desired-count 1 \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_IDS],securityGroups=[$SECURITY_GROUP_ID],assignPublicIp=ENABLED}" \
+            --load-balancers "targetGroupArn=$TG_ARN,containerName=$SERVICE_NAME,containerPort=8080"
+          
+          echo "Created ECS service: $SERVICE_NAME"
+        fi
+

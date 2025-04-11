@@ -1,0 +1,135 @@
+name: Deploy to Amazon EKS
+description: "Deploy to Amazon EKS"
+author: "Praveen Sansaniwal"
+inputs:
+  deploy_branch:
+    description: 'Branch to deploy from'
+    required: true
+    default: 'main'
+  aws_region:
+    description: 'AWS region'
+    required: true
+    default: 'us-west-2'
+  ecr_repository:
+    description: 'ECR repository'
+    required: true
+    default: 'my-app'
+  service_name:
+    description: 'Service name'
+    required: true
+    default: 'MyService'
+  eks_cluster_name:
+    description: 'EKS cluster name'
+    required: true
+    default: 'my-cluster'
+  dockerfile_path:
+    description: 'Path to Dockerfile'
+    required: true
+    default: 'Dockerfile'
+  app_port:
+    description: 'Application port'
+    required: true
+    default: '80'
+  k8s_namespace:
+    description: 'Kubernetes namespace'
+    required: true
+    default: 'default'
+  aws_access_key_id:
+    description: 'AWS_ACCESS_KEY_ID'
+    required: true
+  aws_secret_access_key:
+    description: 'AWS_SECRET_ACCESS_KEY'
+    required: true
+  docker_registry:
+    description: 'AWS ECR Registry Like ACCOUNTID.dkr.ecr.REGION.amazonaws.com'
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+        - name: Checkout code
+          uses: actions/checkout@v4
+
+        - name: Configure AWS credentials
+          uses: aws-actions/configure-aws-credentials@v1
+          with:
+            aws-access-key-id: ${{ inputs.aws_access_key_id }}
+            aws-secret-access-key: ${{ inputs.aws_secret_access_key }}
+            aws-region: ${{ inputs.aws_region }}
+
+        - name: Login to Amazon ECR
+          id: login-ecr
+          uses: aws-actions/amazon-ecr-login@v1
+
+        - name: Determine Dockerfile path
+          id: dockerfile-path
+          shell: bash  
+          run: |
+            if [ -f "${{ inputs.dockerfile_path }}" ]; then
+              echo "DOCKERFILE=${{ inputs.dockerfile_path }}" >> $GITHUB_OUTPUT
+            elif [ -f "dockerfile" ]; then
+              echo "DOCKERFILE=dockerfile" >> $GITHUB_OUTPUT
+            elif [ -f "Dockerfile" ]; then
+              echo "DOCKERFILE=Dockerfile" >> $GITHUB_OUTPUT
+            else
+              echo "No Dockerfile found"
+              exit 1
+            fi
+
+        - name: Build, tag, and push image to Amazon ECR
+          id: build-image
+          shell: bash  
+          env:
+            ECR_REGISTRY: ${{ inputs.docker_registry }}
+            ECR_REPOSITORY: ${{ inputs.ecr_repository }}
+            IMAGE_TAG: ${{ inputs.service_name }}-${{ github.sha }}
+          run: |
+            ls -la
+            docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -f ${{ steps.dockerfile-path.outputs.DOCKERFILE }} .
+            docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+            echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+        - name: Install kubectl
+          uses: azure/setup-kubectl@v2.0
+          with:
+            version: 'latest'
+
+        - name: Update kube config
+          shell: bash  
+          run: aws eks update-kubeconfig --name ${{ inputs.eks_cluster_name }} --region ${{ inputs.aws_region }}
+
+        - name: Check if deployment exists
+          id: check-deployment
+          shell: bash  
+          run: |
+            if kubectl get deployment ${{ inputs.service_name }} -n ${{ inputs.k8s_namespace }} &> /dev/null; then
+              echo "exists=true" >> $GITHUB_OUTPUT
+            else
+              echo "exists=false" >> $GITHUB_OUTPUT
+            fi
+
+        - name: Create or update deployment
+          env:
+            ECR_REGISTRY: ${{ inputs.docker_registry }}
+            ECR_REPOSITORY: ${{ inputs.ecr_repository }}
+            IMAGE_TAG: ${{ inputs.service_name }}-${{ github.sha }}
+          shell: bash  
+          run: |
+            if [ "${{ steps.check-deployment.outputs.exists }}" == "false" ]; then
+              echo "Creating new Namespace, deployment, and service"
+              if ! kubectl get ns ${{ inputs.k8s_namespace }} >/dev/null 2>&1; then
+                kubectl create ns ${{ inputs.k8s_namespace }}
+              else
+                echo "Namespace ${{ inputs.k8s_namespace }} already exists"
+              fi
+              kubectl create deployment ${{ inputs.service_name }} --image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -n ${{ inputs.k8s_namespace }}
+              kubectl expose deployment ${{ inputs.service_name }} --port=${{ inputs.app_port }} --type=ClusterIP -n ${{ inputs.k8s_namespace }}
+            else
+              echo "Updating existing deployment"
+              kubectl set image deployment/${{ inputs.service_name }} $ECR_REPOSITORY=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -n ${{ inputs.k8s_namespace }}
+            fi
+            
+        - name: Verify deployment
+          shell: bash  
+          run: |
+            kubectl rollout status deployment/${{ inputs.service_name }} -n ${{ inputs.k8s_namespace }}

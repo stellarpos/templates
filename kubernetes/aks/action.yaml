@@ -1,0 +1,130 @@
+name: Deploy to Azure AKS
+description: "Deploy to Azure AKS"
+author: "Praveen Sansaniwal"
+inputs:
+  deploy_branch:
+    description: "Branch to deploy from"
+    required: true
+    default: "main"
+  container_registry:
+    description: "ACR name like lunryai.azurecr.io"
+    required: true
+  container_repository:
+    description: "Container repository"
+    required: true
+    default: "my-app"
+  service_name:
+    description: "Service name"
+    required: true
+    default: "MyService"
+  aks_cluster_name:
+    description: "AKS cluster name"
+    required: true
+    default: "my-cluster"
+  resource_group:
+    description: "Resource group containing AKS cluster"
+    required: true
+    default: "my-resource-group"
+  dockerfile_path:
+    description: "Path to Dockerfile"
+    required: true
+    default: "Dockerfile"
+  app_port:
+    description: "Application port"
+    required: true
+    default: "80"
+  k8s_namespace:
+    description: "Kubernetes namespace"
+    required: true
+    default: "default"
+  azure_credentials:
+    description: "Service principal credentials"
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Azure login
+      uses: azure/login@v1
+      with:
+        creds: ${{ inputs.azure_credentials }}
+
+    - name: Get kubeconfig for AKS cluster
+      uses: azure/aks-set-context@v3
+      with:
+        resource-group: ${{ inputs.resource_group }}
+        cluster-name: ${{ inputs.aks_cluster_name }}
+
+    - name: Login to ACR
+      uses: azure/docker-login@v1
+      with:
+        login-server: ${{ inputs.container_registry }}
+        username: ${{ fromJSON(inputs.azure_credentials).clientId }}
+        password: ${{ fromJSON(inputs.azure_credentials).clientSecret }}
+
+    - name: Determine Dockerfile path
+      id: dockerfile-path
+      shell: bash
+      run: |
+        if [ -f "${{ inputs.dockerfile_path }}" ]; then
+          echo "DOCKERFILE=${{ inputs.dockerfile_path }}" >> $GITHUB_OUTPUT
+        elif [ -f "dockerfile" ]; then
+          echo "DOCKERFILE=dockerfile" >> $GITHUB_OUTPUT 
+        elif [ -f "Dockerfile" ]; then
+          echo "DOCKERFILE=Dockerfile" >> $GITHUB_OUTPUT
+        else
+          echo "No Dockerfile found"
+          exit 1
+        fi
+    - name: Check Files
+      id: checkfiles
+      shell: bash
+      run: |
+              ls -la
+    - name: Build, tag and push image
+      shell: bash
+      env:
+        REGISTRY: ${{ inputs.container_registry }}
+        REPOSITORY: ${{ inputs.container_repository }}
+        IMAGE_TAG: ${{ inputs.service_name }}-${{ github.sha }}
+      run: |
+        docker build -t $REGISTRY/$REPOSITORY:$IMAGE_TAG -f ${{ steps.dockerfile-path.outputs.DOCKERFILE }} .
+        docker push $REGISTRY/$REPOSITORY:$IMAGE_TAG
+
+    - name: Setup Kubeconfig
+      shell: bash
+      run: |
+        az aks install-cli
+        az aks get-credentials --resource-group ${{ inputs.resource_group }} --name ${{ inputs.aks_cluster_name }} --overwrite-existing
+        kubelogin convert-kubeconfig -l azurecli
+        
+    - name: Check if deployment exists
+      id: check-deployment
+      shell: bash
+      run: |
+        if kubectl get deployment ${{ inputs.service_name }} -n ${{ inputs.k8s_namespace }} &> /dev/null; then
+          echo "exists=true" >> $GITHUB_OUTPUT
+        else 
+          echo "exists=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Deploy to AKS
+      shell: bash
+      env:
+        REGISTRY: ${{ inputs.container_registry }}
+        REPOSITORY: ${{ inputs.container_repository }}
+        IMAGE_TAG: ${{ inputs.service_name }}-${{ github.sha }}
+      run: |
+        if [ "${{ steps.check-deployment.outputs.exists }}" == "false" ]; then
+          echo "Creating deployment and service"
+          kubectl create deployment ${{ inputs.service_name }} --image=$REGISTRY/$REPOSITORY:$IMAGE_TAG -n ${{ inputs.k8s_namespace }}
+          kubectl expose deployment ${{ inputs.service_name }} --port=${{ inputs.app_port }} -n ${{ inputs.k8s_namespace }}  
+        else
+          echo "Updating deployment"
+          kubectl set image deployment/${{ inputs.service_name }} ${{ inputs.service_name }}=$REGISTRY/$REPOSITORY:$IMAGE_TAG -n ${{ inputs.k8s_namespace }}
+        fi
+
+    - name: Verify deployment
+      shell: bash  
+      run: |
+        kubectl rollout status deployment/${{ inputs.service_name }} -n ${{ inputs.k8s_namespace }}
