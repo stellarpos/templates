@@ -1,5 +1,5 @@
 name: Deploy to Amazon EKS
-description: "Centralized EKS deployment without metrics overhead"
+description: "Deploy to Amazon EKS"
 inputs:
   service_name: { required: true }
   image_tag: { required: true }
