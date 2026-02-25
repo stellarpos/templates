@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${SERVICE_NAME}
+  namespace: ${NAMESPACE}
+  labels:
+    app: ${SERVICE_NAME}
+    # Removed metrics: "true" label
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ${SERVICE_NAME}
+  template:
+    metadata:
+      labels:
+        app: ${SERVICE_NAME}
+    spec:
+      containers:
+      - name: microservice
+        image: ${IMAGE_URL}
+        ports:
+        - containerPort: ${APP_PORT}
+          name: http
+        # Removed secondary metrics port
+        env:
+        - name: ACTIVE_PROFILE
+          value: ${ACTIVE_PROFILE}
+        - name: PORT
+          value: "${APP_PORT}"
+        - name: REDIS_HOST
+          value: redis-master.production.svc.cluster.local
+        - name: REDIS_PORT
+          value: "6379"
+        - name: NEW_RELIC_APP_NAME
+          value: ${SERVICE_NAME}
+        - name: NEW_RELIC_LICENSE_KEY
+          valueFrom:
+            secretKeyRef:
+              name: app-secrets
+              key: NEW_RELIC_LICENSE_KEY
