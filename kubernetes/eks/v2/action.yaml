@@ -1,44 +1,17 @@
 name: Deploy to Amazon EKS
-description: "Deploy to Amazon EKS"
+description: "Centralized EKS deployment without metrics overhead"
 inputs:
-  aws_region:
-    description: 'AWS region'
-    required: true
-  ecr_repository:
-    description: 'ECR repository'
-    required: true
-  service_name:
-    description: 'Service name'
-    required: true
-  eks_cluster_name:
-    description: 'EKS cluster name'
-    required: true
-  dockerfile_path:
-    description: 'Path to Dockerfile'
-    required: false
-    default: 'Dockerfile'
-  app_port:
-    description: 'Application port'
-    required: true
-  k8s_namespace:
-    description: 'Kubernetes namespace'
-    required: true
-  aws_access_key_id:
-    description: 'AWS_ACCESS_KEY_ID'
-    required: true
-  aws_secret_access_key:
-    description: 'AWS_SECRET_ACCESS_KEY'
-    required: true
-  docker_registry:
-    description: 'AWS ECR Registry'
-    required: true
-  skip_build:
-    description: 'Set to true to skip building and pushing a new image (useful for Production)'
-    required: false
-    default: 'false'
-  image_tag:
-    description: 'Specific image tag to deploy. Defaults to service-sha.'
-    required: false
+  service_name: { required: true }
+  image_tag: { required: true }
+  app_port: { required: true }
+  active_profile: { required: true }
+  aws_region: { required: true }
+  ecr_repository: { required: true }
+  eks_cluster_name: { required: true }
+  docker_registry: { required: true }
+  k8s_namespace: { required: true }
+  skip_build: { default: 'false' }
+  dockerfile_path: { default: 'Dockerfile' }
 
 runs:
   using: "composite"
@@ -51,19 +24,15 @@ runs:
         aws-region: ${{ inputs.aws_region }}
 
     - name: Login to Amazon ECR
-      id: login-ecr
       uses: aws-actions/amazon-ecr-login@v1
 
-    - name: Build and Push image
+    - name: Build and Push (Conditional)
       if: inputs.skip_build == 'false'
       shell: bash
-      env:
-        ECR_REGISTRY: ${{ inputs.docker_registry }}
-        ECR_REPOSITORY: ${{ inputs.ecr_repository }}
-        FINAL_TAG: ${{ inputs.image_tag != '' && inputs.image_tag || format('{0}-{1}', inputs.service_name, github.sha) }}
       run: |
-        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$FINAL_TAG -f ${{ inputs.dockerfile_path }} .
-        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$FINAL_TAG
+        FULL_IMAGE="${{ inputs.docker_registry }}/${{ inputs.ecr_repository }}:${{ inputs.image_tag }}"
+        docker build -t $FULL_IMAGE -f ${{ inputs.dockerfile_path }} .
+        docker push $FULL_IMAGE
 
     - name: Update kube config
       shell: bash
@@ -72,14 +41,20 @@ runs:
     - name: Deploy to EKS
       shell: bash
       env:
-        ECR_REGISTRY: ${{ inputs.docker_registry }}
-        ECR_REPOSITORY: ${{ inputs.ecr_repository }}
-        FINAL_TAG: ${{ inputs.image_tag != '' && inputs.image_tag || format('{0}-{1}', inputs.service_name, github.sha) }}
+        IMAGE_URL: "${{ inputs.docker_registry }}/${{ inputs.ecr_repository }}:${{ inputs.image_tag }}"
+        SERVICE_NAME: ${{ inputs.service_name }}
+        NAMESPACE: ${{ inputs.k8s_namespace }}
+        APP_PORT: ${{ inputs.app_port }}
+        ACTIVE_PROFILE: ${{ inputs.active_profile }}
       run: |
-        if ! kubectl get deployment ${{ inputs.service_name }} -n ${{ inputs.k8s_namespace }} &> /dev/null; then
-          kubectl create deployment ${{ inputs.service_name }} --image=$ECR_REGISTRY/$ECR_REPOSITORY:$FINAL_TAG -n ${{ inputs.k8s_namespace }}
-          kubectl expose deployment ${{ inputs.service_name }} --port=${{ inputs.app_port }} --type=ClusterIP -n ${{ inputs.k8s_namespace }}
+        if [ -f "k8s/deployment.yaml" ]; then
+          TEMPLATE_PATH="k8s/deployment.yaml"
         else
-          kubectl set image deployment/${{ inputs.service_name }} $ECR_REPOSITORY=$ECR_REGISTRY/$ECR_REPOSITORY:$FINAL_TAG -n ${{ inputs.k8s_namespace }}
+          TEMPLATE_PATH="${{ github.action_path }}/base-deployment.yaml"
         fi
+
+        mkdir -p .generated_k8s
+        envsubst < $TEMPLATE_PATH > .generated_k8s/final.yaml
+        kubectl apply -f .generated_k8s/final.yaml
+        
         kubectl rollout status deployment/${{ inputs.service_name }} -n ${{ inputs.k8s_namespace }}
