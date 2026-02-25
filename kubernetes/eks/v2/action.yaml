@@ -1,0 +1,85 @@
+name: Deploy to Amazon EKS
+description: "Deploy to Amazon EKS"
+inputs:
+  aws_region:
+    description: 'AWS region'
+    required: true
+  ecr_repository:
+    description: 'ECR repository'
+    required: true
+  service_name:
+    description: 'Service name'
+    required: true
+  eks_cluster_name:
+    description: 'EKS cluster name'
+    required: true
+  dockerfile_path:
+    description: 'Path to Dockerfile'
+    required: false
+    default: 'Dockerfile'
+  app_port:
+    description: 'Application port'
+    required: true
+  k8s_namespace:
+    description: 'Kubernetes namespace'
+    required: true
+  aws_access_key_id:
+    description: 'AWS_ACCESS_KEY_ID'
+    required: true
+  aws_secret_access_key:
+    description: 'AWS_SECRET_ACCESS_KEY'
+    required: true
+  docker_registry:
+    description: 'AWS ECR Registry'
+    required: true
+  skip_build:
+    description: 'Set to true to skip building and pushing a new image (useful for Production)'
+    required: false
+    default: 'false'
+  image_tag:
+    description: 'Specific image tag to deploy. Defaults to service-sha.'
+    required: false
+
+runs:
+  using: "composite"
+  steps:
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{ inputs.aws_access_key_id }}
+        aws-secret-access-key: ${{ inputs.aws_secret_access_key }}
+        aws-region: ${{ inputs.aws_region }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+
+    - name: Build and Push image
+      if: inputs.skip_build == 'false'
+      shell: bash
+      env:
+        ECR_REGISTRY: ${{ inputs.docker_registry }}
+        ECR_REPOSITORY: ${{ inputs.ecr_repository }}
+        FINAL_TAG: ${{ inputs.image_tag != '' && inputs.image_tag || format('{0}-{1}', inputs.service_name, github.sha) }}
+      run: |
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$FINAL_TAG -f ${{ inputs.dockerfile_path }} .
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$FINAL_TAG
+
+    - name: Update kube config
+      shell: bash
+      run: aws eks update-kubeconfig --name ${{ inputs.eks_cluster_name }} --region ${{ inputs.aws_region }}
+
+    - name: Deploy to EKS
+      shell: bash
+      env:
+        ECR_REGISTRY: ${{ inputs.docker_registry }}
+        ECR_REPOSITORY: ${{ inputs.ecr_repository }}
+        FINAL_TAG: ${{ inputs.image_tag != '' && inputs.image_tag || format('{0}-{1}', inputs.service_name, github.sha) }}
+      run: |
+        if ! kubectl get deployment ${{ inputs.service_name }} -n ${{ inputs.k8s_namespace }} &> /dev/null; then
+          kubectl create deployment ${{ inputs.service_name }} --image=$ECR_REGISTRY/$ECR_REPOSITORY:$FINAL_TAG -n ${{ inputs.k8s_namespace }}
+          kubectl expose deployment ${{ inputs.service_name }} --port=${{ inputs.app_port }} --type=ClusterIP -n ${{ inputs.k8s_namespace }}
+        else
+          kubectl set image deployment/${{ inputs.service_name }} $ECR_REPOSITORY=$ECR_REGISTRY/$ECR_REPOSITORY:$FINAL_TAG -n ${{ inputs.k8s_namespace }}
+        fi
+        kubectl rollout status deployment/${{ inputs.service_name }} -n ${{ inputs.k8s_namespace }}
